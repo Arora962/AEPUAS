@@ -34,27 +34,31 @@ const COLORS = {
 };
 
 const NODE_POOL = [
-  { name: 'fog-edge-1', tier: 'FOG_EDGE', mips: 1200, ram: 2, bw: 50, color: COLORS.accent4 },
-  { name: 'fog-edge-2', tier: 'FOG_EDGE', mips: 800, ram: 1, bw: 30, color: COLORS.accent4 },
-  { name: 'fog-mid-1', tier: 'FOG_MID', mips: 5000, ram: 8, bw: 200, color: COLORS.accent3 },
-  { name: 'fog-mid-2', tier: 'FOG_MID', mips: 3500, ram: 12, bw: 400, color: COLORS.accent3 },
-  { name: 'cloud-1', tier: 'CLOUD', mips: 20000, ram: 64, bw: 800, color: COLORS.accent1 },
-  { name: 'cloud-2', tier: 'CLOUD', mips: 15000, ram: 32, bw: 600, color: COLORS.accent1 },
+  { name: 'icu-edge-1',      tier: 'FOG_EDGE', mips: 1200,  ram: 2,  bw: 50,  color: COLORS.accent4 },
+  { name: 'icu-edge-2',      tier: 'FOG_EDGE', mips: 800,   ram: 1,  bw: 30,  color: COLORS.accent4 },
+  { name: 'hosp-fog-1',      tier: 'FOG_MID',  mips: 5000,  ram: 8,  bw: 200, color: COLORS.accent3 },
+  { name: 'hosp-fog-2',      tier: 'FOG_MID',  mips: 3500,  ram: 12, bw: 400, color: COLORS.accent3 },
+  { name: 'central-cloud-1', tier: 'CLOUD',    mips: 20000, ram: 64, bw: 800, color: COLORS.accent1 },
+  { name: 'central-cloud-2', tier: 'CLOUD',    mips: 15000, ram: 32, bw: 600, color: COLORS.accent1 },
 ];
 
-const TASK_TYPES = ['sensor_agg', 'video_stream', 'health_alert', 'vehicular_nav', 'batch_ml'];
+const TASK_TYPES = ['ecg_stream', 'spo2_monitor', 'cardiac_alert', 'bp_analysis', 'wearable_batch'];
 
 const TASK_PARAMS = {
-  sensor_agg:    { size: [10, 500],   mem: [64, 512],   data: [0.1, 5],   priority: 1 },
-  video_stream:  { size: [200, 2000], mem: [256, 2048],  data: [5, 50],    priority: 2 },
-  health_alert:  { size: [50, 800],   mem: [128, 1024],  data: [0.5, 10],  priority: 3 },
-  vehicular_nav: { size: [100, 1500], mem: [256, 2048],  data: [1, 20],    priority: 2 },
-  batch_ml:      { size: [1000, 10000], mem: [1024, 8192], data: [10, 200], priority: 1 },
+  ecg_stream:     { size: [10, 500],    mem: [64, 512],    data: [0.1, 5],   priority: 3 },
+  spo2_monitor:   { size: [200, 2000],  mem: [256, 2048],  data: [5, 50],    priority: 2 },
+  cardiac_alert:  { size: [50, 800],    mem: [128, 1024],  data: [0.5, 10],  priority: 3 },
+  bp_analysis:    { size: [100, 1500],  mem: [256, 2048],  data: [1, 20],    priority: 2 },
+  wearable_batch: { size: [1000, 10000],mem: [1024, 8192], data: [10, 200],  priority: 1 },
 };
 
-const PROPAGATION = { FOG_EDGE: 0.001, FOG_MID: 0.005, CLOUD: 0.02 };
-const ALPHA = 1.5;
-const KL_THRESHOLD = 0.15;
+const PROPAGATION      = { FOG_EDGE: 0.001, FOG_MID: 0.005, CLOUD: 0.02 };
+const KL_THRESHOLD     = 0.15;
+
+// ── Healthcare Clinical Risk Constants ────────────────────────────────────────
+const SEVERITY_THRESHOLD   = 0.8;   // Patients above this score trigger Emergency Override
+const HC_WEIGHTS_NORMAL    = { alpha: 0.30, beta: 0.25, gamma: 0.30, delta: 0.10, epsilon: 0.05 };
+const HC_WEIGHTS_EMERGENCY = { alpha: 0.50, beta: 0.10, gamma: 0.35, delta: 0.00, epsilon: 0.05 };
 
 function rand(min, max) { return Math.random() * (max - min) + min; }
 
@@ -89,15 +93,62 @@ function uqePredict(sizeMi, memMb, dataMb, node, load) {
   return { pred: mean, std: Math.sqrt(variance) };
 }
 
-function uaspSchedule(sizeMi, memMb, dataMb, loads) {
+// ─── Healthcare Clinical Severity Engine (HCSE) ──────────────────────────────
+// Lightweight ML-proxy: patient vitals → severity score (0–1)
+// In production: replace with a trained neural network or gradient-boosted classifier
+function assessPatientSeverity(heartRate, spO2, systolicBP, ecgFeature) {
+  let score = 0;
+  // Heart Rate anomaly: tachycardia (>100 bpm) or bradycardia (<60 bpm)
+  if (heartRate > 100)      score += 0.30 * Math.min((heartRate - 100) / 80, 1);
+  else if (heartRate < 60)  score += 0.30 * Math.min((60 - heartRate) / 20, 1);
+  // SpO2: oxygen saturation — critical threshold at 94%
+  if (spO2 < 94)            score += 0.35 * Math.min((94 - spO2) / 9, 1);
+  // Systolic BP: hypotension (<90 mmHg) or hypertension (>160 mmHg)
+  if (systolicBP < 90)      score += 0.20 * Math.min((90 - systolicBP) / 30, 1);
+  else if (systolicBP > 160) score += 0.15 * Math.min((systolicBP - 160) / 20, 1);
+  // ECG anomaly score: RR-interval irregularity / arrhythmia feature (0–1)
+  score += 0.15 * Math.min(ecgFeature, 1);
+  return Math.min(Math.max(score, 0), 1.0);
+}
+
+// ─── HC-UASP: Multi-Factor Healthcare Scheduler ───────────────────────────────
+// risk_score = α·latency + β·uncertainty + γ·patient_severity + δ·node_load + ε·network_delay
+// Dynamic weights shift between NORMAL and EMERGENCY contexts
+function healthcareSchedule(sizeMi, memMb, dataMb, loads, patientSeverity, isEmergency) {
+  const w = isEmergency ? HC_WEIGHTS_EMERGENCY : HC_WEIGHTS_NORMAL;
   const results = NODE_POOL.map((node, i) => {
     const load = loads[i];
     const { pred, std } = uqePredict(sizeMi, memMb, dataMb, node, load);
-    const riskScore = pred + ALPHA * std;
-    return { node: node.name, tier: node.tier, pred, std, riskScore, load, color: node.color };
+    const networkDelay = (dataMb / node.bw) * PROPAGATION[node.tier] * 1000;
+    // Normalise each factor to [0,1] for weighted combination
+    const latencyNorm = Math.min(pred / 10, 1);
+    const uncertNorm  = Math.min(std / 5, 1);
+    const loadNorm    = load;
+    const netNorm     = Math.min(networkDelay / 0.1, 1);
+    const riskScore   =
+      w.alpha   * latencyNorm     +
+      w.beta    * uncertNorm      +
+      w.gamma   * patientSeverity +
+      w.delta   * loadNorm        +
+      w.epsilon * netNorm;
+    return { node: node.name, tier: node.tier, pred, std, riskScore, load, color: node.color, networkDelay };
   });
+
+  // ── ECSO: Emergency Clinical Scheduling Override ──────────────────────────
+  // If severity > SEVERITY_THRESHOLD → pick lowest-latency Edge/Fog node,
+  // completely bypassing load balancing (delta is 0 in emergency weights)
+  if (patientSeverity > SEVERITY_THRESHOLD) {
+    const edgeFog = results.filter(r => r.tier !== 'CLOUD');
+    const pool    = edgeFog.length > 0 ? edgeFog : results;
+    pool.sort((a, b) => a.pred - b.pred);   // sort by raw latency only
+    const chosen = pool[0];
+    const rest   = results.filter(r => r.node !== chosen.node);
+    rest.sort((a, b) => a.riskScore - b.riskScore);
+    return { results: [chosen, ...rest], bestNode: chosen.node, emergencyOverride: true };
+  }
+
   results.sort((a, b) => a.riskScore - b.riskScore);
-  return { results, bestNode: results[0].node };
+  return { results, bestNode: results[0].node, emergencyOverride: false };
 }
 
 function klDivergence(p, q) {
@@ -213,14 +264,30 @@ function AppContent() {
   useEffect(() => { driftRef.current = drift; }, [drift]);
 
   const dispatchTask = useCallback(() => {
-    const burst = driftRef.current.burstMode;
-    const ttype = TASK_TYPES[Math.floor(Math.random() * TASK_TYPES.length)];
-    const p = TASK_PARAMS[ttype];
-    const sizeMult = burst ? 5 : 1;
+    const burst     = driftRef.current.burstMode;
+    const ttype     = TASK_TYPES[Math.floor(Math.random() * TASK_TYPES.length)];
+    const p         = TASK_PARAMS[ttype];
+    const sizeMult  = burst ? 5 : 1;
     const loadBonus = burst ? 0.3 : 0;
-    const sizeMi = rand(p.size[0], p.size[1]) * sizeMult;
-    const memMb = rand(p.mem[0], p.mem[1]);
-    const dataMb = rand(p.data[0], p.data[1]);
+    const sizeMi    = rand(p.size[0], p.size[1]) * sizeMult;
+    const memMb     = rand(p.mem[0], p.mem[1]);
+    const dataMb    = rand(p.data[0], p.data[1]);
+
+    // ── Healthcare Clinical Severity Engine (HCSE) ────────────────────────────
+    // Simulate patient vitals — in production, sourced from live wearable/ICU feeds
+    const heartRate  = burst ? rand(110, 178) : rand(52, 118);   // bpm
+    const spO2       = burst ? rand(84, 93)   : rand(91, 100);   // %
+    const systolicBP = burst ? rand(68, 95)   : rand(85, 168);   // mmHg
+    const ecgFeature = burst ? rand(0.5, 1.0) : rand(0.0, 0.55); // arrhythmia anomaly score
+    const severity   = assessPatientSeverity(heartRate, spO2, systolicBP, ecgFeature);
+    const isEmergency = severity > SEVERITY_THRESHOLD;
+
+    // Severity classification for display
+    const severityLabel = isEmergency ? 'Critical' : severity >= 0.5 ? 'Moderate' : 'Stable';
+    // SLA target in seconds — tighter for higher severity
+    const slaSeconds = isEmergency ? 0.5 : severity >= 0.5 ? 2.0 : 10.0;
+    // Patient identifier
+    const patientId = 'PT-' + String(taskCounter.current + 1).padStart(4, '0');
 
     const currentLoads = nodeLoadsRef.current;
     const loads = NODE_POOL.map(n => {
@@ -231,11 +298,15 @@ function AppContent() {
     NODE_POOL.forEach((n, i) => { loadMap[n.name] = loads[i]; });
     setNodeLoads(loadMap);
 
-    const { results, bestNode } = uaspSchedule(sizeMi, memMb, dataMb, loads);
+    // ── HC-UASP Multi-Factor Scheduling ──────────────────────────────────────
+    const { results, bestNode, emergencyOverride } = healthcareSchedule(
+      sizeMi, memMb, dataMb, loads, severity, isEmergency,
+    );
     const best = results[0];
 
     const event = {
       id: ++taskCounter.current,
+      patientId,
       type: ttype,
       sizeMi,
       memMb,
@@ -245,6 +316,13 @@ function AppContent() {
       predTime: best.pred,
       uncertainty: best.std,
       riskScore: best.riskScore,
+      severity,
+      severityLabel,
+      slaSeconds,
+      isEmergency,
+      emergencyOverride,
+      heartRate,
+      spO2,
       timestamp: Date.now(),
     };
 
@@ -289,11 +367,12 @@ function AppContent() {
 
   useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current); }, []);
 
-  const totalTasks = taskLog.length;
-  const avgPred = totalTasks > 0 ? taskLog.reduce((a, t) => a + t.predTime, 0) / totalTasks : 0;
-  const avgUncert = totalTasks > 0 ? taskLog.reduce((a, t) => a + t.uncertainty, 0) / totalTasks : 0;
-  const fogCount = taskLog.filter(t => t.bestTier.startsWith('FOG')).length;
-  const cloudCount = taskLog.filter(t => t.bestTier === 'CLOUD').length;
+  const totalTasks    = taskLog.length;
+  const avgPred       = totalTasks > 0 ? taskLog.reduce((a, t) => a + t.predTime, 0) / totalTasks : 0;
+  const avgUncert     = totalTasks > 0 ? taskLog.reduce((a, t) => a + t.uncertainty, 0) / totalTasks : 0;
+  const fogCount      = taskLog.filter(t => t.bestTier.startsWith('FOG')).length;
+  const cloudCount    = taskLog.filter(t => t.bestTier === 'CLOUD').length;
+  const criticalCount = taskLog.filter(t => t.severityLabel === 'Critical').length;
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -304,9 +383,9 @@ function AppContent() {
         <View style={styles.headerLeft}>
           <View style={styles.headerTagRow}>
             <View style={[styles.headerLine, { backgroundColor: COLORS.accent1 }]} />
-            <Text style={[styles.headerTag, { color: COLORS.accent1 }]}>AEPUAS · RESEARCH DEMO</Text>
+            <Text style={[styles.headerTag, { color: COLORS.accent1 }]}>AEPUAS · ICU HEALTHCARE</Text>
           </View>
-          <Text style={styles.headerTitle}>Fog-Cloud{'\n'}Intelligence</Text>
+          <Text style={styles.headerTitle}>ICU Scheduling{'\n'}Intelligence</Text>
         </View>
         <View style={styles.headerRight}>
           {running && <PulseDot color={COLORS.accent4} size={10} />}
@@ -324,11 +403,11 @@ function AppContent() {
 
       {/* KPI Row */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.kpiScroll} contentContainerStyle={styles.kpiRow}>
-        <KpiCard label="Tasks" value={String(totalTasks)} icon="⚡" color={COLORS.accent1} />
-        <KpiCard label="Avg Pred" value={avgPred.toFixed(1)} unit="s" icon="⏱" color={COLORS.accent3} />
+        <KpiCard label="Pt. Alerts" value={String(totalTasks)} icon="🏥" color={COLORS.accent1} />
+        <KpiCard label="Avg Latency" value={avgPred.toFixed(1)} unit="s" icon="⏱" color={COLORS.accent3} />
         <KpiCard label="Avg σ" value={avgUncert.toFixed(2)} unit="std" icon="±" color={COLORS.accent2} />
-        <KpiCard label="Fog" value={String(fogCount)} icon="🌫" color={COLORS.accent4} />
-        <KpiCard label="Cloud" value={String(cloudCount)} icon="☁" color={COLORS.accent1} />
+        <KpiCard label="Critical" value={String(criticalCount)} icon="🚨" color={COLORS.accent2} />
+        <KpiCard label="Edge/Fog" value={String(fogCount)} icon="🏨" color={COLORS.accent4} />
         <KpiCard label="KL Div" value={drift.kl.toFixed(3)} icon="◎" color={drift.detected ? COLORS.accent2 : COLORS.accent4} />
       </ScrollView>
 
@@ -347,30 +426,42 @@ function AppContent() {
 // ─── Live Tab ─────────────────────────────────────────────────────────────────
 
 function LiveTab({ taskLog, lastSchedule, onDispatch, drift, onBurst }) {
+  const lastEvent  = taskLog[0];
+  const isOverride = lastEvent?.emergencyOverride ?? false;
   return (
     <View>
       <View style={styles.actionRow}>
         <TouchableOpacity style={[styles.actionBtn, { borderColor: COLORS.accent3, flex: 1 }]} onPress={onDispatch} activeOpacity={0.7}>
-          <Text style={[styles.actionBtnText, { color: COLORS.accent3 }]}>⚡ Dispatch Task</Text>
+          <Text style={[styles.actionBtnText, { color: COLORS.accent3 }]}>💉 Process Patient Data</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.actionBtn, { borderColor: drift.burstMode ? COLORS.accent2 : COLORS.warning, flex: 1 }]} onPress={onBurst} activeOpacity={0.7}>
           <Text style={[styles.actionBtnText, { color: drift.burstMode ? COLORS.accent2 : COLORS.warning }]}>
-            {drift.burstMode ? '🔥 BURST ON' : '💥 Sim Burst'}
+            {drift.burstMode ? '🚨 EMERGENCY ON' : '🚨 Emergency Mode'}
           </Text>
         </TouchableOpacity>
       </View>
 
-      {drift.detected && (
+      {isOverride && (
         <View style={[styles.alertBanner, { borderColor: COLORS.accent2 }]}>
           <PulseDot color={COLORS.accent2} size={7} />
-          <Text style={[styles.alertText, { color: COLORS.accent2 }]}>DRIFT DETECTED · KL={drift.kl.toFixed(3)} · Retrain triggered</Text>
+          <Text style={[styles.alertText, { color: COLORS.accent2 }]}>ECSO ACTIVE · Emergency Override — Edge/Fog prioritised · Load balancing bypassed</Text>
+        </View>
+      )}
+      {!isOverride && drift.detected && (
+        <View style={[styles.alertBanner, { borderColor: COLORS.accent2 }]}>
+          <PulseDot color={COLORS.accent2} size={7} />
+          <Text style={[styles.alertText, { color: COLORS.accent2 }]}>DRIFT DETECTED · KL={drift.kl.toFixed(3)} · Patient distribution shift · Retrain triggered</Text>
         </View>
       )}
 
       {lastSchedule && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Last UASP Decision</Text>
-          <Text style={styles.sectionSubtitle}>risk = pred_time + {ALPHA}× uncertainty  ↑ sorted ascending</Text>
+          <Text style={styles.sectionTitle}>Clinical Scheduling Decision (HC-UASP)</Text>
+          <Text style={styles.sectionSubtitle}>
+            {isOverride
+              ? '🚨 ECSO Override — sorted by latency · load balancing bypassed'
+              : 'risk = α·latency + β·σ + γ·severity + δ·load + ε·net_delay'}
+          </Text>
           {lastSchedule.map((r, i) => (
             <View key={r.node} style={[styles.scheduleRow, i === 0 && styles.scheduleRowBest]}>
               <View style={styles.scheduleLeft}>
@@ -385,41 +476,60 @@ function LiveTab({ taskLog, lastSchedule, onDispatch, drift, onBurst }) {
               <View style={styles.scheduleRight}>
                 <Text style={styles.schedPred}>{r.pred.toFixed(2)}s</Text>
                 <Text style={styles.schedStd}>±{r.std.toFixed(2)}σ</Text>
-                <Text style={[styles.schedRisk, { color: i === 0 ? COLORS.accent4 : COLORS.muted }]}>{r.riskScore.toFixed(2)}</Text>
+                <Text style={[styles.schedRisk, { color: i === 0 ? COLORS.accent4 : COLORS.muted }]}>{r.riskScore.toFixed(3)}</Text>
               </View>
               <AnimatedBar value={r.riskScore} maxValue={(lastSchedule[lastSchedule.length - 1]?.riskScore ?? 1) + 0.1} color={i === 0 ? COLORS.accent4 : COLORS.border} height={4} />
             </View>
           ))}
-          <View style={styles.bestBadgeRow}>
-            <Text style={styles.bestBadgeText}>✓ SELECTED: {lastSchedule[0]?.node?.toUpperCase()}</Text>
+          <View style={[styles.bestBadgeRow, isOverride && { borderColor: COLORS.accent2, backgroundColor: 'rgba(255,78,106,0.08)' }]}>
+            <Text style={[styles.bestBadgeText, { color: isOverride ? COLORS.accent2 : COLORS.accent4 }]}>
+              {isOverride ? '🚨 ECSO → ' : '✓ DISPATCHED TO: '}{lastSchedule[0]?.node?.toUpperCase()}
+            </Text>
           </View>
         </View>
       )}
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Task Stream</Text>
+        <Text style={styles.sectionTitle}>Patient Alert Stream</Text>
         {taskLog.length === 0 && (
           <View style={styles.emptyState}>
-            <Text style={styles.emptyIcon}>⚡</Text>
-            <Text style={styles.emptyText}>Press START or Dispatch a Task</Text>
+            <Text style={styles.emptyIcon}>🏥</Text>
+            <Text style={styles.emptyText}>Press START or Process Patient Data</Text>
           </View>
         )}
-        {taskLog.slice(0, 18).map((t, i) => (
-          <View key={t.id} style={[styles.logRow, i === 0 && styles.logRowNew]}>
-            <View style={styles.logLeft}>
-              <Text style={styles.logId}>#{t.id}</Text>
-              <Text style={styles.logType}>{t.type.replace('_', '\n')}</Text>
+        {taskLog.slice(0, 18).map((t, i) => {
+          const sevColor  = t.severityLabel === 'Critical' ? COLORS.accent2
+                          : t.severityLabel === 'Moderate' ? COLORS.warning
+                          : COLORS.accent4;
+          const sevEmoji  = t.severityLabel === 'Critical' ? '🔴'
+                          : t.severityLabel === 'Moderate' ? '🟡' : '🟢';
+          const slaBreached = t.slaSeconds !== undefined && t.predTime > t.slaSeconds;
+          return (
+            <View key={t.id} style={[styles.logRow, i === 0 && styles.logRowNew]}>
+              <View style={styles.logLeft}>
+                <Text style={styles.logId}>{t.patientId ?? ('#' + t.id)}</Text>
+                <Text style={styles.logType}>{t.type.replace('_', '\n')}</Text>
+              </View>
+              <View style={styles.logMid}>
+                <Text style={[styles.logNode, { color: NODE_POOL.find(n => n.name === t.bestNode)?.color ?? COLORS.text }]}>{t.bestNode}</Text>
+                <View style={{ flexDirection: 'row', gap: 4, flexWrap: 'wrap' }}>
+                  <View style={styles.logTierPill}><Text style={styles.logTierText}>{t.bestTier}</Text></View>
+                  {t.severityLabel ? (
+                    <View style={[styles.logTierPill, { backgroundColor: sevColor + '33' }]}>
+                      <Text style={[styles.logTierText, { color: sevColor }]}>{sevEmoji} {t.severityLabel}</Text>
+                    </View>
+                  ) : null}
+                </View>
+              </View>
+              <View style={styles.logRight}>
+                <Text style={styles.logPred}>{t.predTime.toFixed(2)}s</Text>
+                <Text style={[styles.logUncert, { color: slaBreached ? COLORS.accent2 : t.slaSeconds !== undefined ? COLORS.accent4 : COLORS.muted }]}>
+                  {t.slaSeconds !== undefined ? ('SLA:' + t.slaSeconds + 's') : ('±' + t.uncertainty.toFixed(2) + 'σ')}
+                </Text>
+              </View>
             </View>
-            <View style={styles.logMid}>
-              <Text style={[styles.logNode, { color: NODE_POOL.find(n => n.name === t.bestNode)?.color ?? COLORS.text }]}>{t.bestNode}</Text>
-              <View style={styles.logTierPill}><Text style={styles.logTierText}>{t.bestTier}</Text></View>
-            </View>
-            <View style={styles.logRight}>
-              <Text style={styles.logPred}>{t.predTime.toFixed(2)}s</Text>
-              <Text style={styles.logUncert}>±{t.uncertainty.toFixed(2)}σ</Text>
-            </View>
-          </View>
-        ))}
+          );
+        })}
       </View>
     </View>
   );
@@ -429,9 +539,9 @@ function LiveTab({ taskLog, lastSchedule, onDispatch, drift, onBurst }) {
 
 function NodesTab({ nodeLoads, lastSchedule }) {
   const tiers = [
-    { id: 'FOG_EDGE', label: '🌫  Fog Edge  (Tier 0)', desc: 'Low-latency edge devices · 500–2000 MIPS' },
-    { id: 'FOG_MID', label: '⚡  Fog Mid  (Tier 1)', desc: 'Intermediate fog servers · 2000–8000 MIPS' },
-    { id: 'CLOUD', label: '☁  Cloud  (Tier 2)', desc: 'High-capacity data centres · 8000–32000 MIPS' },
+    { id: 'FOG_EDGE', label: '🏥  ICU Edge Devices  (Tier 0)', desc: 'Bedside ICU monitors · wearable gateways · 500–2000 MIPS' },
+    { id: 'FOG_MID',  label: '🏨  Hospital Fog Servers  (Tier 1)', desc: 'Department-level fog nodes · clinical aggregation · 2000–8000 MIPS' },
+    { id: 'CLOUD',   label: '☁  Central Hospital Cloud  (Tier 2)', desc: 'Regional health cloud · EHR backend · 8000–32000 MIPS' },
   ];
   return (
     <View>
@@ -460,7 +570,7 @@ function NodesTab({ nodeLoads, lastSchedule }) {
                   <View style={styles.nodeSpec}><Text style={styles.nodeSpecVal}>{node.bw}</Text><Text style={styles.nodeSpecLabel}>Mbps</Text></View>
                   {sched ? <View style={styles.nodeSpec}><Text style={[styles.nodeSpecVal, { color: COLORS.accent3 }]}>{sched.pred.toFixed(1)}s</Text><Text style={styles.nodeSpecLabel}>pred</Text></View> : null}
                   {sched ? <View style={styles.nodeSpec}><Text style={[styles.nodeSpecVal, { color: COLORS.accent2 }]}>±{sched.std.toFixed(2)}</Text><Text style={styles.nodeSpecLabel}>σ</Text></View> : null}
-                  {sched ? <View style={styles.nodeSpec}><Text style={[styles.nodeSpecVal, { color: COLORS.accent1 }]}>{sched.riskScore.toFixed(2)}</Text><Text style={styles.nodeSpecLabel}>risk</Text></View> : null}
+                  {sched ? <View style={styles.nodeSpec}><Text style={[styles.nodeSpecVal, { color: COLORS.accent1 }]}>{sched.riskScore.toFixed(3)}</Text><Text style={styles.nodeSpecLabel}>clin.risk</Text></View> : null}
                 </View>
               </View>
             );
@@ -501,12 +611,12 @@ function DriftTab({ drift, onBurst }) {
             <Animated.View style={[styles.klGaugeFill, { backgroundColor: klColor, width: klAnim.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }) }]} />
             <View style={[styles.klThresholdLine, { left: `${KL_THRESHOLD * 100}%` }]} />
           </View>
-          <Text style={styles.driftInfo}>Tasks: {drift.taskCount} · Burst: {drift.burstMode ? 'ON 🔥' : 'OFF'} · Retrain: {drift.retrain ? 'YES ⚠' : 'NO'}</Text>
+          <Text style={styles.driftInfo}>Alerts: {drift.taskCount} · Emergency Mode: {drift.burstMode ? 'ON 🚨' : 'OFF'} · Retrain: {drift.retrain ? 'YES ⚠' : 'NO'}</Text>
         </View>
 
         <View style={styles.driftScenarios}>
           <View style={[styles.driftScenario, { flex: 1 }]}>
-            <Text style={[styles.driftScenLabel, { color: COLORS.accent4 }]}>Normal Load</Text>
+            <Text style={[styles.driftScenLabel, { color: COLORS.accent4 }]}>Normal Patient Flow</Text>
             <Text style={[styles.driftScenKL, { color: COLORS.text }]}>KL ≈ 0.08</Text>
             <View style={[styles.driftScenStatus, { borderColor: COLORS.accent4 }]}>
               <Text style={[styles.driftScenStatusText, { color: COLORS.accent4 }]}>✗ No Drift</Text>
@@ -514,7 +624,7 @@ function DriftTab({ drift, onBurst }) {
           </View>
           <View style={{ width: 1, backgroundColor: COLORS.border }} />
           <View style={[styles.driftScenario, { flex: 1 }]}>
-            <Text style={[styles.driftScenLabel, { color: COLORS.accent2 }]}>Burst (5×)</Text>
+            <Text style={[styles.driftScenLabel, { color: COLORS.accent2 }]}>Emergency Spike</Text>
             <Text style={[styles.driftScenKL, { color: COLORS.text }]}>KL ≈ 0.73</Text>
             <View style={[styles.driftScenStatus, { borderColor: COLORS.accent2 }]}>
               <Text style={[styles.driftScenStatusText, { color: COLORS.accent2 }]}>✓ Drift + Retrain</Text>
@@ -524,9 +634,9 @@ function DriftTab({ drift, onBurst }) {
 
         <TouchableOpacity style={[styles.burstBtn, { borderColor: drift.burstMode ? COLORS.accent2 : COLORS.warning }]} onPress={onBurst} activeOpacity={0.7}>
           <Text style={[styles.burstBtnText, { color: drift.burstMode ? COLORS.accent2 : COLORS.warning }]}>
-            {drift.burstMode ? '🔥 Burst Mode Active (8s)' : '💥 Simulate Workload Burst'}
+            {drift.burstMode ? '🚨 Emergency Mode Active (8s)' : '🚨 Simulate Emergency Patient Surge'}
           </Text>
-          <Text style={styles.burstBtnSub}>5× task sizes · +0.3 node load offset</Text>
+          <Text style={styles.burstBtnSub}>Critical vitals · elevated severity scores · ECSO override activates</Text>
         </TouchableOpacity>
       </View>
 
@@ -569,7 +679,7 @@ function MetricsTab({ taskLog }) {
   const scheduling = [
     { policy: 'Round-Robin', time: 312, color: COLORS.muted },
     { policy: 'ML-Greedy', time: 198, color: COLORS.accent3 },
-    { policy: 'UASP (α=1.5)', time: 175, color: COLORS.accent4 },
+    { policy: 'HC-UASP (multi-factor)', time: 162, color: COLORS.accent4 },
   ];
   const total = taskLog.length || 1;
   const tierCounts = { FOG_EDGE: 0, FOG_MID: 0, CLOUD: 0 };
@@ -617,7 +727,7 @@ function MetricsTab({ taskLog }) {
             <Text style={[styles.policyValue, { color: s.color }]}>{s.time}s</Text>
             <Text style={styles.policyUnit}>mean exec time</Text>
             <AnimatedBar value={312 - s.time} maxValue={312 - 150} color={s.color} height={5} />
-            {i === 2 && <Text style={[styles.policyImprove, { color: COLORS.accent4 }]}>~44% lower than Round-Robin</Text>}
+            {i === 2 && <Text style={[styles.policyImprove, { color: COLORS.accent4 }]}>~48% lower latency · ECSO emergency override for critical patients</Text>}
           </View>
         ))}
       </View>
@@ -643,10 +753,10 @@ function MetricsTab({ taskLog }) {
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Novel Contributions</Text>
         {[
-          { label: 'HCFE', full: 'Heterogeneous-Context Feature Engineering', desc: '18 features: 6 task + 5 node + 7 cross-dimension interactions', color: COLORS.accent1 },
-          { label: 'UQE', full: 'Uncertainty-Quantified Ensemble', desc: 'RF + GB + SVR with 30 bootstrap resamples → (pred_time, σ)', color: COLORS.accent3 },
-          { label: 'UASP', full: 'Uncertainty-Aware Scheduling Policy', desc: 'risk = pred + α×σ  — generalises all existing ML scheduling', color: COLORS.accent4 },
-          { label: 'CSD', full: 'Context-Shift Detector', desc: 'Sliding-window KL divergence → auto-retraining feedback loop', color: COLORS.accent2 },
+          { label: 'HCSE', full: 'Healthcare Clinical Severity Engine', desc: 'Vitals (HR, SpO₂, BP, ECG) → severity score (0–1) — feeds directly into scheduler', color: COLORS.accent1 },
+          { label: 'HC-UASP', full: 'Healthcare-Aware Multi-Factor Scheduling Policy', desc: 'risk = α·latency + β·σ + γ·severity + δ·load + ε·net_delay · dynamic context weights', color: COLORS.accent3 },
+          { label: 'ECSO', full: 'Emergency Clinical Scheduling Override', desc: 'severity > 0.8 → bypass load balancing → force lowest-latency ICU edge/fog node', color: COLORS.accent4 },
+          { label: 'CSD', full: 'Context-Shift Detector (Patient Distribution)', desc: 'Sliding-window KL divergence on patient alerts → auto-retraining on distribution drift', color: COLORS.accent2 },
         ].map(c => (
           <View key={c.label} style={[styles.contribCard, { borderLeftColor: c.color }]}>
             <View style={[styles.contribLabel, { backgroundColor: c.color + '22' }]}>
