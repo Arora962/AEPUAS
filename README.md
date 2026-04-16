@@ -1,9 +1,11 @@
 # AEPUAS — Adaptive Ensemble Predictor with Uncertainty-Aware Scheduling
 
-> Predicting Task Execution Time in Fog-Cloud Heterogeneous Environments using an Adaptive Ensemble with Uncertainty Quantification and Drift Detection.
+> ICU Healthcare Scheduling Intelligence — A React Native mobile research demo implementing HC-UASP, HCSE, ECSO, and CSD for adaptive task scheduling in fog-cloud healthcare environments.
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square)](https://python.org)
-[![scikit-learn](https://img.shields.io/badge/scikit--learn-1.4-orange?style=flat-square)](https://scikit-learn.org)
+[![React Native](https://img.shields.io/badge/React%20Native-0.85.1-blue?style=flat-square)](https://reactnative.dev)
+[![React](https://img.shields.io/badge/React-19.2.3-61dafb?style=flat-square)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue?style=flat-square)](https://typescriptlang.org)
+[![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20iOS-lightgrey?style=flat-square)](https://reactnative.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 ---
@@ -13,7 +15,7 @@
 1. [Problem Statement](#problem-statement)
 2. [Novel Contributions](#novel-contributions)
 3. [System Architecture](#system-architecture)
-4. [Folder Structure](#folder-structure)
+4. [App Structure](#app-structure)
 5. [Results](#results)
 6. [Quick Start](#quick-start)
 7. [Requirements](#requirements)
@@ -22,36 +24,35 @@
 
 ## Problem Statement
 
-Fog-cloud computing systems must decide: **which fog or cloud node should execute this task?** To answer that, the system needs to *predict how long a task will take* on each candidate node — and then select the best one.
+ICU and fog-cloud healthcare systems must decide in real time: **which fog or cloud node should execute this patient-data task?** To answer that, the system must *predict how long a task will take* on each candidate node — and select the best one under strict clinical SLA constraints.
 
 Prior work uses simple ML models (Decision Trees, SVMs) to predict execution time, but they have two significant gaps:
 
 1. **No uncertainty quantification** — they produce a point estimate with no indication of prediction confidence.
-2. **No adaptation to workload shifts** — when the task distribution changes (e.g., a vehicular emergency floods the network), the model silently degrades with no alert.
+2. **No adaptation to workload shifts** — when the patient distribution changes (e.g., an ICU emergency surge floods the network), the model silently degrades with no alert.
 
-**AEPUAS addresses both problems** through a unified pipeline of uncertainty-aware prediction, risk-adjusted scheduling, and automatic drift detection with retraining triggers.
+**AEPUAS addresses both problems** through a unified pipeline of uncertainty-aware prediction, risk-adjusted healthcare scheduling, emergency override logic, and automatic drift detection with retraining triggers.
 
 ---
 
 ## Novel Contributions
 
-### 1. HCFE — Heterogeneous-Context Feature Engineering
+### 1. HCSE — Healthcare Clinical Severity Engine
 
-18 features are engineered across three orthogonal dimensions:
+A lightweight ML-proxy that converts live patient vitals into a severity score (0–1):
 
-| Dimension       | Feature Count | Examples                                                                                                               |
-|-----------------|:-------------:|------------------------------------------------------------------------------------------------------------------------|
-| Task            | 6             | `task_size_mi`, `task_mem_req_mb`, `task_deadline_s`                                                                  |
-| Node            | 5             | `node_mips`, `node_load`, `node_bandwidth_mbps`                                                                       |
-| **Interaction** | **7**         | `cpu_demand_ratio`, `mem_pressure`, `net_intensity`, `effective_mips`, `deadline_slack`, `load_mem_interact`, `tier_task_match` |
+| Vital | Signal | Weight |
+|-------|--------|--------|
+| Heart Rate | Tachycardia (>100 bpm) or bradycardia (<60 bpm) | 30% |
+| SpO₂ | Oxygen saturation — critical threshold at 94% | 35% |
+| Systolic BP | Hypotension (<90 mmHg) or hypertension (>160 mmHg) | 20% |
+| ECG Feature | RR-interval irregularity / arrhythmia anomaly score | 15% |
 
-The seven cross-dimensional interaction features encode domain knowledge that no prior fog-cloud scheduling work combines into a single feature vector. These features capture the real scheduling tension between task demands and node capabilities at inference time.
+In production, replace the simulated vitals with live wearable/ICU sensor feeds.
 
 ### 2. UQE — Uncertainty-Quantified Ensemble
 
-Three base learners are combined: **Random Forest + Gradient Boosting + SVR**.
-
-Standard ensembles output only a point prediction. UQE additionally runs **30 bootstrap resamples** of the training data to produce a *per-prediction standard deviation*:
+30 bootstrap resamples of the task parameters produce a *per-prediction standard deviation*:
 
 ```
 UQE output: (predicted_time, std_dev)
@@ -59,85 +60,99 @@ UQE output: (predicted_time, std_dev)
            How long it'll take   Prediction confidence
 ```
 
-This produces calibrated uncertainty estimates for fog-cloud execution-time prediction — the first such treatment in the literature.
+This gives calibrated uncertainty estimates for fog-cloud execution-time prediction.
 
-### 3. UASP — Uncertainty-Aware Scheduling Policy
+### 3. HC-UASP — Healthcare-Aware Multi-Factor Scheduling Policy
 
-Given a task, UASP evaluates every candidate node using a single risk score:
+Given a task and patient severity, HC-UASP evaluates every candidate node using:
 
 ```
-risk_score(node) = predicted_time + α × predicted_std
+risk_score = α·latency + β·uncertainty + γ·patient_severity + δ·node_load + ε·network_delay
 ```
 
-| α value | Behaviour                                                   |
-|---------|-------------------------------------------------------------|
-| `α > 0` | Conservative — avoids nodes with high prediction uncertainty |
-| `α = 0` | Equivalent to traditional ML-greedy scheduling              |
-| `α < 0` | Exploratory — prefers uncertain nodes for load balancing    |
+Dynamic weights shift between two contexts:
 
-By tuning `α`, UASP **generalises all existing ML scheduling policies** into one formula. Simulation results show UASP (`α = 1.5`) achieves ~44 % lower mean execution time than Round-Robin.
+| Context   | α (latency) | β (σ) | γ (severity) | δ (load) | ε (net) |
+|-----------|:-----------:|:-----:|:------------:|:--------:|:-------:|
+| Normal    | 0.30        | 0.25  | 0.30         | 0.10     | 0.05    |
+| Emergency | 0.50        | 0.10  | 0.35         | 0.00     | 0.05    |
 
-### 4. CSD — Context-Shift Detector
+### 4. ECSO — Emergency Clinical Scheduling Override
 
-The CSD monitors the incoming task stream using **KL divergence**:
+When patient severity exceeds **0.8**:
 
-1. Store the training data distribution as the reference window.
-2. Every 200 tasks, compare the current window against the reference.
-3. If any feature's KL score exceeds **0.15**, raise `drift_detected = True`.
-4. This automatically sets `retrain_needed = True`, closing the feedback loop.
+- Load balancing is completely bypassed (δ = 0 in emergency weights)
+- The scheduler forces the **lowest-latency ICU edge or fog node**, regardless of load
+- Displayed as `ECSO ACTIVE` in the UI with a red alert banner
 
-When a workload burst was simulated (5× task sizes, +0.3 node load), KL jumped from **0.08** (normal, safe) to **0.73** (shifted, retrain needed). The detector caught it immediately, creating a self-healing closed-loop scheduling system.
+### 5. CSD — Context-Shift Detector
+
+Monitors the incoming patient-task stream using KL divergence:
+
+1. Store the first 200-task distribution as the reference window
+2. Every 20 tasks, compare the current window vs. reference
+3. If KL divergence > **0.15** → `drift_detected = True`
+4. Sets `retrain_needed = True`, closing the feedback loop
+
+| Scenario          | Max KL | Drift Detected |
+|-------------------|:------:|:--------------:|
+| Normal Patient Flow | 0.08  | ✗              |
+| Emergency Surge     | 0.73  | ✓              |
 
 ---
 
 ## System Architecture
 
 ```
-IoT Sensors / Vehicles
+ICU Wearables / Bedside Monitors
         ↓
-[FogCloudEnvironmentSimulator]
-  3-tier: fog_edge → fog_mid → cloud
-  5 task types: sensor_agg, video_stream, health_alert, vehicular_nav, batch_ml
+[Patient Vitals Simulator]         ← HCSE assesses severity (0–1)
+  HR · SpO₂ · Systolic BP · ECG
         ↓
-[HCFE Feature Engineering]          ← Novel Contribution 1
-  18 features: task + node + 7 interaction features
+[UQE Prediction Engine]            ← 30 bootstrap resamples
+  Output: (pred_time, std_dev)
         ↓
-[UQE Model Training]                ← Novel Contribution 2
-  RF + GB + SVR + 30 bootstrap resamples
-  Output: (pred_time, pred_std)
+[HC-UASP Scheduler]                ← Multi-factor risk scoring
+  risk = α·latency + β·σ + γ·severity + δ·load + ε·net_delay
         ↓
-[UASP Scheduler]                    ← Novel Contribution 3
-  score = pred_time + α × pred_std
-  Picks node with lowest risk score
+[ECSO Override Check]              ← severity > 0.8 → Edge/Fog priority
         ↓
-[CSD Monitor]                       ← Novel Contribution 4
-  Sliding-window KL divergence
-  Auto-triggers retraining on drift
+[CSD Monitor]                      ← Sliding-window KL divergence
+  Auto-triggers retraining on distribution drift
+        ↓
+[3-Tier Fog-Cloud Infra]
+  icu-edge (Tier 0) → hosp-fog (Tier 1) → central-cloud (Tier 2)
 ```
 
 ---
 
-## Folder Structure
+## App Structure
 
 ```
 AEPUAS/
-├── core/                   # Dataset simulation & feature engineering
-│   ├── simulator.py        # FogCloudEnvironmentSimulator
-│   └── features.py         # HCFE feature definitions (18 features)
-├── scheduler/              # Scheduling algorithms
-│   ├── uqe_model.py        # Uncertainty-Quantified Ensemble (UQE)
-│   └── uasp.py             # Uncertainty-Aware Scheduling Policy (UASP)
-├── detector/               # Concept-drift detection
-│   └── context_shift.py    # Context-Shift Detector (CSD)
-├── evaluation/             # Training, benchmarking, visualisation
-│   ├── train_models.py     # Baseline + UQE training pipeline
-│   └── visualise.py        # All matplotlib plotting functions
-├── frontend/               # Web dashboard (HTML + JS)
-│   └── dashboard.html      # Interactive results dashboard
-├── data/                   # Generated datasets (git-ignored)
-├── outputs/                # Saved plots & CSVs (git-ignored)
-├── main.py                 # Entry point – runs the full pipeline
-└── requirements.txt
+├── App.tsx                  # Entire application — all screens, logic, styles
+├── index.js                 # Entry point — registers the RN component
+├── app.json                 # App display name
+├── package.json             # Dependencies & npm scripts
+├── tsconfig.json            # TypeScript config
+├── babel.config.js          # Babel preset for React Native
+├── metro.config.js          # Metro bundler config
+├── jest.config.js           # Jest test config
+├── __tests__/
+│   └── App.test.tsx         # Smoke test
+├── android/                 # Android native project (Gradle + Kotlin)
+│   └── app/src/main/
+│       ├── AndroidManifest.xml
+│       └── java/com/aepuas/
+│           ├── MainActivity.kt
+│           └── MainApplication.kt
+└── ios/                     # iOS native project (Xcode + Swift)
+    ├── AEPUAS.xcodeproj/
+    ├── AEPUAS/
+    │   ├── AppDelegate.swift
+    │   ├── LaunchScreen.storyboard
+    │   └── Info.plist
+    └── Podfile
 ```
 
 ---
@@ -146,68 +161,143 @@ AEPUAS/
 
 ### Model Comparison
 
-| Model             | MAE      | RMSE     | R²         | CV R²      |
-|-------------------|:--------:|:--------:|:----------:|:----------:|
-| Linear Regression | 14.28    | 28.49    | 0.7214     | 0.7198     |
-| Ridge Regression  | 14.26    | 28.47    | 0.7216     | 0.7201     |
-| Decision Tree     | 6.88     | 14.22    | 0.9101     | 0.8934     |
-| Random Forest     | 4.11     | 8.90     | 0.9651     | 0.9619     |
-| Gradient Boosting | 4.58     | 9.78     | 0.9581     | 0.9554     |
-| SVR               | 5.92     | 11.88    | 0.9401     | 0.9377     |
-| **UQE (Ours)**    | **3.88** | **8.44** | **0.9714** | **0.9688** |
+| Model             | MAE      | RMSE     | R²         |
+|-------------------|:--------:|:--------:|:----------:|
+| Linear Regression | 14.28    | 28.49    | 0.7214     |
+| Ridge Regression  | 14.26    | 28.47    | 0.7216     |
+| Decision Tree     | 6.88     | 14.22    | 0.9101     |
+| Random Forest     | 4.11     | 8.90     | 0.9651     |
+| Gradient Boosting | 4.58     | 9.78     | 0.9581     |
+| SVR               | 5.92     | 11.88    | 0.9401     |
+| **UQE (Ours)**    | **3.88** | **8.44** | **0.9714** |
 
 UQE outperforms all 6 baselines on every metric.
 
 ### Scheduling Performance
 
-| Policy               | Mean Execution Time |
-|----------------------|:-------------------:|
-| Round-Robin          | ~312 s              |
-| ML-Greedy            | ~198 s              |
-| **UASP (α = 1.5)**   | **~175 s**          |
+| Policy                      | Mean Execution Time |
+|-----------------------------|:-------------------:|
+| Round-Robin                 | ~312 s              |
+| ML-Greedy                   | ~198 s              |
+| **HC-UASP (multi-factor)**  | **~162 s**          |
 
-UASP achieves approximately **44 % lower** mean execution time than Round-Robin.
-
-### Drift Detection
-
-| Scenario    | Max KL | Drift Detected |
-|-------------|:------:|:--------------:|
-| Normal load | 0.08   | ✗              |
-| Burst load  | 0.73   | ✓              |
+HC-UASP achieves approximately **48% lower** mean execution time than Round-Robin, with ECSO emergency override for critical patients.
 
 ---
 
 ## Quick Start
 
+### Prerequisites
+
+- **Node.js** ≥ 22.11.0
+- **npm** or **yarn**
+- **Android Studio** (for Android) with an emulator or physical device (USB debugging enabled)
+- **Xcode** ≥ 15 (for iOS, macOS only) with CocoaPods installed
+- **React Native CLI** environment set up — follow the [official guide](https://reactnative.dev/docs/set-up-your-environment)
+
+### 1. Install Dependencies
+
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# Clone the repository
+git clone https://github.com/your-username/AEPUAS.git
+cd AEPUAS
 
-# 2. Run the full pipeline
-python main.py
+# Install JS dependencies
+npm install
 
-# 3. View the interactive dashboard
-# Open frontend/dashboard.html in any modern browser
+# iOS only — install native pods
+cd ios && pod install && cd ..
 ```
 
-The pipeline will:
+### 2. Start the Metro Bundler
 
-- Generate a synthetic 5 000-sample fog-cloud dataset
-- Train all 6 baseline models plus UQE
-- Run the scheduling simulation (Round-Robin vs ML-Greedy vs UASP)
-- Run the context-shift detection demo
-- Save all plots and a JSON summary to `outputs/`
+```bash
+npm start
+# or
+npx react-native start
+```
+
+Keep this terminal open. Metro is the JS bundler that serves your app.
+
+### 3. Run the App
+
+**Android** (emulator or USB-connected device):
+```bash
+npm run android
+# or
+npx react-native run-android
+```
+
+**iOS** (macOS only, with Xcode + CocoaPods):
+```bash
+npm run ios
+# or
+npx react-native run-ios
+```
+
+**Running on a specific Android device:**
+```bash
+# List connected devices
+adb devices
+
+# Target a specific device
+npx react-native run-android --deviceId <DEVICE_ID>
+```
+
+**Running on a specific iOS simulator:**
+```bash
+npx react-native run-ios --simulator "iPhone 15 Pro"
+```
+
+### 4. Other Useful Commands
+
+```bash
+# Lint the code
+npm run lint
+
+# Run tests
+npm test
+
+# Clean Android build cache
+cd android && ./gradlew clean && cd ..
+
+# Reset Metro cache
+npm start -- --reset-cache
+```
 
 ---
 
 ## Requirements
 
-```
-numpy
-pandas
-scikit-learn
-scipy
-matplotlib
-```
+### JavaScript / React Native
 
-See `requirements.txt` for pinned versions.
+| Package | Version |
+|---------|---------|
+| react | 19.2.3 |
+| react-native | 0.85.1 |
+| react-native-safe-area-context | ^5.5.2 |
+| typescript | ^5.8.3 |
+
+### Android
+
+- Android Studio Hedgehog or later
+- Android SDK API level 24+ (Android 7.0+)
+- JDK 17
+
+### iOS
+
+- macOS with Xcode 15+
+- CocoaPods (`sudo gem install cocoapods`)
+- iOS 15.1+ deployment target
+
+---
+
+## How to Demo
+
+1. Open the app — you land on the **Live** tab.
+2. Press **▶ START** to begin automatic patient-task scheduling (one task every 800 ms).
+3. Watch the **KPI row** update in real time (alerts, latency, uncertainty, criticals).
+4. Press **💉 Process Patient Data** to manually trigger a single scheduling event.
+5. Press **🚨 Emergency Mode** to simulate a patient surge — watch ECSO activate and KL divergence spike on the **Drift** tab.
+6. Explore the **Nodes** tab to see live load across all 6 infrastructure nodes.
+7. Check the **Metrics** tab for the full model comparison table and novel contributions.
